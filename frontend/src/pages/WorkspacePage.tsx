@@ -76,7 +76,7 @@ export default function WorkspacePage() {
 
       // Restore chat history from backend
       apiService.getSession(project.sessionId)
-        .then(data => {
+        .then((data: any) => {
           const history: ChatMessage[] = (data.messages ?? []).map((m: any) => ({
             id: crypto.randomUUID(),
             role: m.role as 'user' | 'assistant',
@@ -307,8 +307,6 @@ export default function WorkspacePage() {
       <WorkspaceHeader
         activeView={activeView}
         onViewChange={setActiveView}
-        sessionId={sessionId ?? undefined}
-        onReload={() => window.location.reload()}
       />
 
       {/* Status banner */}

@@ -1,11 +1,9 @@
 import { Share, Settings, Download, Zap } from "lucide-react"
 import { ViewToggle } from "./ViewToggle"
 
-export function WorkspaceHeader({ activeView, onViewChange, sessionId, onReload }: {
+export function WorkspaceHeader({ activeView, onViewChange }: {
   activeView: "code" | "preview";
   onViewChange: (view: "code" | "preview") => void;
-  sessionId?: string;
-  onReload?: () => void;
 }) {
   return (
     <header

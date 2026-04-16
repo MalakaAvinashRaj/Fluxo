@@ -8,7 +8,7 @@ type PhonePreviewProps = {
   onRebuild?: () => void
 }
 
-export function PhonePreview({ sessionId, previewUrl, isLoading = false, onRebuild }: PhonePreviewProps) {
+export function PhonePreview({ previewUrl, isLoading = false, onRebuild }: PhonePreviewProps) {
   const [error, setError] = useState<string | null>(null)
   const [touch, setTouch] = useState({ x: 0, y: 0, show: false })
   const phoneContentRef = useRef<HTMLDivElement>(null)
