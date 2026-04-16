@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Design tokens (dark default) ───────────────────────────────────────── */
+:root {
+  --bg:              #141414;
+  --surface:         #1a1a1a;
+  --surface-raised:  #222222;
+  --surface-overlay: #2c2c2c;
+  --border:          #282828;
+  --border-strong:   #363636;
+  --text-1:          #f0f0f0;
+  --text-2:          #b0b0b0;
+  --text-3:          #787878;
+  --text-4:          #505050;
+  --accent:          #44D62C;
+  --accent-bg:       rgba(68,214,44,0.10);
+  --accent-border:   rgba(68,214,44,0.20);
+}
+
+
+html {
+  font-size: 17px;
+}
+
+html,
+body,
+#root {
+  background-color: var(--bg);
+  color: var(--text-1);
+  height: 100%;
+  overscroll-behavior: none;
+  transition: background-color 0.25s ease, color 0.25s ease;
+}
+
+/* Smooth theme transition on all elements */
+*, *::before, *::after {
+  transition: background-color 0.25s ease, border-color 0.25s ease;
+}
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-4); }
+
+::selection { background: var(--accent-bg); color: var(--text-1); }
+
+/* Cursor hover highlight — added/removed via JS, never fights inline React styles */
+.cursor-hover {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px var(--accent-bg) !important;
+}
+
+/* Force cursor:none on all interactive elements — UA stylesheet sets cursor:pointer on buttons which overrides inheritance */
+[data-cursor="zap"] button,
+[data-cursor="zap"] a,
+[data-cursor="zap"] select,
+[data-cursor="zap"] label,
+[data-cursor="zap"] [role="button"] { cursor: none; }
+/* Inputs/textareas keep text cursor */
+[data-cursor="zap"] input,
+[data-cursor="zap"] textarea { cursor: text; }

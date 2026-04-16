@@ -1,0 +1,45 @@
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+!.env.example
+!.env.production
+
+# ── Claude Code (IDE config, not project files) ───────────────────────────────
+.claude/
+
+# ── preview-server (v1 — superseded by backend/) ─────────────────────────────
+preview-server/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ── Node / Bun ────────────────────────────────────────────────────────────────
+node_modules/
+*.tsbuildinfo
+.cache/
+.eslintcache
+
+# ── Build outputs ─────────────────────────────────────────────────────────────
+frontend/dist/
+frontend/dist-ssr/
+
+# ── Runtime data (Docker volumes — server only) ───────────────────────────────
+backend/sessions/
+backend/chroma_db/
+backend/flutter_output/
+
+# ── Logs & PIDs ───────────────────────────────────────────────────────────────
+*.log
+*.pid
+
+# ── OS & editors ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
