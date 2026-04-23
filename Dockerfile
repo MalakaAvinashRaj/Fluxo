@@ -12,8 +12,8 @@ RUN apt-get update && apt-get install -y \
 
 # Configure git globally for the container
 RUN git config --global init.defaultBranch main \
-  && git config --global user.name "FlutterAI" \
-  && git config --global user.email "ai@flutterai.dev" \
+  && git config --global user.name "Fluxo" \
+  && git config --global user.email "fluxoai@gmail.com" \
   && git config --global safe.directory '*'
 
 # Install Flutter with specific version for reproducibility

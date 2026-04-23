@@ -1,31 +1,40 @@
 # Fluxo
 
-Fluxo is an AI-powered Flutter app builder. Describe what you want and it generates a complete, runnable Flutter app — live in a phone preview inside the browser.
+An AI-powered Flutter app builder. Describe what you want, the agent plans it out, then writes, builds, and serves a live Flutter web app — rendered in a phone preview inside the browser.
 
 ## How it works
 
-1. User types a prompt in the chat (e.g. "build me a todo app")
-2. The Python agent writes Flutter code, copies it into a persistent Docker container, and runs `flutter build web`
-3. The built output is served back through the backend and rendered in an iframe phone preview
-4. The user can iterate — chat to make changes, hit Rebuild, or view the generated code
+1. User opens the workspace and types a prompt
+2. The agent runs a **planning phase** — classifies complexity, summarises the build plan, and asks clarifying questions if needed
+3. Once the plan is confirmed, the Python agent writes Flutter code into a persistent Docker container
+4. The container runs `flutter build web`; the output is copied back to the host and served as static files
+5. The built app renders in an iframe phone preview — live in the browser
+6. The user iterates via chat (up to 20 messages per project)
+
+No account or login needed — access is IP-based.
 
 ## Stack
 
 - **Frontend** — React 19, TypeScript, Vite, Tailwind CSS
-- **Backend** — Python, FastAPI, OpenAI API
-- **Agent** — Autonomous tool-calling loop with RAG (ChromaDB + Flutter docs)
-- **Build layer** — Persistent Docker container running Flutter SDK
-- **Infra** — Nginx reverse proxy, Cloudflare Tunnel for home-server deployment
+- **Backend** — Python, FastAPI, autonomous agent with tool execution loop
+- **AI** — OpenAI (GPT-4o / GPT-4o-mini), RAG over Flutter docs via ChromaDB
+- **Build layer** — Single persistent Docker container running Flutter SDK (shared across all sessions)
+- **Infra** — Cloudflare Tunnel for public HTTPS access (TLS terminated by Cloudflare)
 
 ## Project structure
 
 ```
 fluxo/
-├── frontend/          React + TypeScript UI
-├── backend/           Python FastAPI agent
-├── nginx/             Nginx reverse proxy config
-├── Dockerfile         Flutter build container image
-└── docker-compose.yml Production orchestration
+├── frontend/          React UI (chat, code editor, file explorer, phone preview)
+├── backend/           Python FastAPI backend + autonomous agent
+│   ├── agent.py       Core agent loop — planning phase + tool selection + execution
+│   ├── api.py         REST endpoints + IP quota enforcement
+│   ├── config.py      Environment-based configuration (pydantic-settings)
+│   ├── services/      Session manager, LLM service, RAG, Flutter preview, task executor
+│   ├── tools/         File ops, shell commands, tool registry
+│   ├── errors/        Error handling and recovery
+│   └── agent_logging/ Structured logging and metrics
+└── Dockerfile         Flutter SDK build container image
 ```
 
 ## Local development
@@ -36,42 +45,85 @@ cd backend
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # add your OPENAI_API_KEY
-python main.py         # starts on :8080
+python main.py         # starts on :8081
 ```
 
 **Frontend**
 ```bash
 cd frontend
 npm install
-npm run dev            # starts on :5173
+npm run dev            # starts on :5173, proxies API to :8081
 ```
 
-The frontend talks to the backend at `http://localhost:8080` by default.
+**Flutter build container** (required for preview to work)
+```bash
+docker build -t flutter-dev-server:latest .
+```
 
-## Production (Docker Compose)
+## Production deployment (home Linux server)
+
+The backend serves everything — API, Flutter previews, and the built React frontend — on a single port. No Nginx required.
 
 ```bash
-# Build the Flutter container image first
+# 1. Build the Flutter container image (once, or on Dockerfile changes)
 docker build -t flutter-dev-server:latest .
 
-# Build the React app
+# 2. Build the React frontend
 cd frontend && npm install && npm run build && cd ..
 
-# Add your key
-echo "OPENAI_API_KEY=sk-..." > backend/.env
+# 3. Configure environment
+cp backend/.env.example /opt/fluxo/.env
+# Edit /opt/fluxo/.env — set OPENAI_API_KEY, AGENT_PORT=8081, etc.
 
-# Start
-docker compose up -d
+# 4. Install and start the systemd service
+sudo cp deploy/fluxo-backend.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now fluxo-backend
+
+# 5. Point Cloudflare Tunnel to port 8081
+# In /etc/cloudflared/config.yml, set:
+#   service: http://localhost:8081
+# Then: sudo systemctl restart cloudflared
 ```
 
-Nginx serves the React build at `/` and proxies all API and preview traffic to the backend.
+For redeployment after code changes:
+```bash
+./deploy.sh
+```
+
+## API endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/sessions` | Create a new session |
+| `GET` | `/sessions/{id}` | Get session info and chat history |
+| `POST` | `/sessions/{id}/chat/stream` | Stream AI agent response (SSE) |
+| `GET` | `/sessions/{id}/warmup` | Warm up the Flutter project in the container (SSE) |
+| `POST` | `/sessions/{id}/rebuild` | Rebuild the Flutter app |
+| `GET` | `/preview/{id}/{path}` | Serve Flutter web build output (static files) |
+| `GET` | `/my-sessions` | List previous sessions for the current IP |
+| `GET` | `/health` | Health check |
+| `GET` | `/stats` | Usage stats |
+
+## Usage limits
+
+| Limit | Value |
+|-------|-------|
+| Projects per IP | 4 (hard cap, no reset) |
+| Messages per project | 20 (hard cap) |
+
+No login required. Limits are tracked per IP and persist across server restarts.
 
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
 | `OPENAI_API_KEY` | — | Required |
-| `AGENT_PORT` | `8080` | Backend listen port |
+| `AGENT_HOST` | `0.0.0.0` | Backend bind host |
+| `AGENT_PORT` | `8081` | Backend listen port |
 | `DEFAULT_MODEL` | `gpt-4o-mini` | OpenAI model |
-| `PREVIEW_BASE_URL` | `http://localhost:8080` | Set to `""` in prod (relative URLs via Nginx) |
-| `VITE_API_BASE_URL` | `http://localhost:8080` | Set to `""` in prod build |
+| `MAX_TOKENS` | `128000` | Max context tokens |
+| `LOG_LEVEL` | `INFO` | Logging level |
+| `LOG_FORMAT` | `console` | `console` or `json` |
+| `SESSION_STORAGE_PATH` | `./sessions` | Where session JSON files are stored |
+| `FLUTTER_OUTPUT_DIR` | `./flutter_output` | Where build outputs are stored on host |

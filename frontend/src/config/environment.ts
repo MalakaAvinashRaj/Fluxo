@@ -11,17 +11,7 @@ export const ENV = {
 export const isProduction = ENV.NODE_ENV === 'production'
 export const isDevelopment = ENV.NODE_ENV === 'development'
 
-// Validate required environment variables
-const requiredEnvVars = {
-  API_BASE_URL: ENV.API_BASE_URL,
-}
-
 export const validateEnvironment = () => {
-  const missing = Object.entries(requiredEnvVars)
-    .filter(([_, value]) => !value)
-    .map(([key]) => key)
-
-  if (missing.length > 0) {
-    throw new Error(`Missing required environment variables: ${missing.join(', ')}`)
-  }
+  // API_BASE_URL is intentionally empty in production (same-origin via Nginx)
+  // Nothing strictly required at runtime — keys live server-side
 }
