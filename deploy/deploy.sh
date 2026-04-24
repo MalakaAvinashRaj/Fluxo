@@ -18,7 +18,7 @@ npm run build
 
 echo "==> Pulling latest code..."
 cd "$REPO_ROOT"
-git pull
+git fetch origin && git reset --hard origin/main
 
 echo "==> Restarting backend service..."
 sudo systemctl restart fluxo-backend
