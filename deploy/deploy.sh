@@ -16,15 +16,11 @@ npm ci
 echo "==> Building frontend into backend/static..."
 npm run build
 
+echo "==> Pulling latest code..."
+cd "$REPO_ROOT"
+git pull
+
 echo "==> Restarting backend service..."
 sudo systemctl restart fluxo-backend
 
-echo "==> Waiting for service to come up..."
-sleep 5
-sudo systemctl status fluxo-backend --no-pager
-
-echo ""
-echo "Deploy complete. Site is live at https://fluxo.avinashrajmalaka.in"
-echo ""
-echo "NOTE: Make sure your Cloudflare tunnel points to http://localhost:8081"
-echo "      (not port 80 — that's CasaOS)"
+echo "Deploy complete."

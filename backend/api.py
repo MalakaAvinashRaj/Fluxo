@@ -1,6 +1,9 @@
 """FastAPI backend for the autonomous agent system."""
 
 import asyncio
+import hashlib
+import hmac
+import subprocess
 import uuid
 import json
 from pathlib import Path
@@ -823,6 +826,50 @@ async def websocket_endpoint(
             error=str(e),
             exc_info=True
         )
+
+
+_WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+_REPO_ROOT = Path(__file__).parent.parent
+
+
+async def _run_deploy():
+    """Pull latest code, rebuild frontend, restart service."""
+    try:
+        logger.info("Webhook deploy started")
+        proc = await asyncio.create_subprocess_exec(
+            "bash", str(_REPO_ROOT / "deploy" / "deploy.sh"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(_REPO_ROOT),
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            logger.info("Webhook deploy succeeded")
+        else:
+            logger.error("Webhook deploy failed", output=stdout.decode())
+    except Exception as e:
+        logger.error("Webhook deploy error", error=str(e))
+
+
+@app.post("/webhook/github")
+async def github_webhook(http_request: Request, background_tasks: BackgroundTasks):
+    """Receive GitHub push events and trigger an auto-deploy."""
+    body = await http_request.body()
+
+    # Verify signature
+    if _WEBHOOK_SECRET:
+        sig_header = http_request.headers.get("X-Hub-Signature-256", "")
+        mac = hmac.new(_WEBHOOK_SECRET.encode(), body, hashlib.sha256)
+        expected = "sha256=" + mac.hexdigest()
+        if not hmac.compare_digest(sig_header, expected):
+            raise HTTPException(status_code=401, detail="Invalid signature")
+
+    event = http_request.headers.get("X-GitHub-Event", "")
+    if event == "push":
+        background_tasks.add_task(_run_deploy)
+        logger.info("Deploy triggered by GitHub push")
+
+    return {"ok": True}
 
 
 # Serve React frontend — must be last so API routes take priority
