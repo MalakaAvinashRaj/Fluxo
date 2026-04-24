@@ -1,5 +1,6 @@
 """Error handlers for the autonomous agent system."""
 
+import traceback
 from typing import Dict, Any, Optional
 from fastapi import Request, HTTPException
 from fastapi.responses import JSONResponse

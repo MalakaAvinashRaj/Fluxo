@@ -7,8 +7,9 @@ import {
 import { getAllProjects, deleteProject, updateProject, createProject, getProject } from '../utils/projects'
 import type { Project } from '../utils/projects'
 import { apiService } from '../services/api'
+import { ENV } from '../config/environment'
 
-const API = 'http://localhost:8080'
+const API = ENV.API_BASE_URL
 
 async function pruneStaleProjects(): Promise<void> {
   const projects = getAllProjects()

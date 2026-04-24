@@ -8,6 +8,7 @@ import { ChatPanel } from "../components/workspace/ChatPanel"
 import { ChevronLeft, ChevronRight } from "lucide-react"
 import { apiService, ApiError } from "../services/api"
 import { useApi } from "../hooks/useApi"
+import { ENV } from "../config/environment"
 import { Logger } from "../utils/logger"
 import { getProject, createProject, updateProject } from "../utils/projects"
 
@@ -263,7 +264,7 @@ export default function WorkspacePage() {
     ])
 
     try {
-      const res = await fetch(`${import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080'}/sessions/${activeSessionId}/rebuild`, { method: 'POST' })
+      const res = await fetch(`${ENV.API_BASE_URL}/sessions/${activeSessionId}/rebuild`, { method: 'POST' })
       const result = await res.json()
       if (result.success) {
         setPreviewUrl(result.previewUrl)

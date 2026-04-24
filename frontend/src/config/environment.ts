@@ -1,7 +1,8 @@
 export const ENV = {
   NODE_ENV: import.meta.env.NODE_ENV || 'development',
-  // Empty string = same-origin (Nginx proxy in production). Falls back to localhost in dev.
-  API_BASE_URL: import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080',
+  // Empty string = same-origin in production (FastAPI serves frontend + API on same port).
+  // Falls back to localhost:8080 in local dev.
+  API_BASE_URL: import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.PROD ? '' : 'http://localhost:8080'),
   API_TIMEOUT: parseInt(import.meta.env.VITE_API_TIMEOUT || '30000'),
   RETRY_ATTEMPTS: parseInt(import.meta.env.VITE_RETRY_ATTEMPTS || '3'),
   RETRY_DELAY: parseInt(import.meta.env.VITE_RETRY_DELAY || '1000'),
