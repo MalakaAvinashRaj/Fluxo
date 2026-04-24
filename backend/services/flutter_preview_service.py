@@ -39,12 +39,10 @@ class FlutterBuildService:
             )
             await rm_proc.communicate()
 
-            import platform as _platform
-            _arch = "linux/arm64" if _platform.machine() == "arm64" else "linux/amd64"
             proc = await asyncio.create_subprocess_exec(
                 "docker", "run",
                 "--name", CONTAINER_NAME,
-                f"--platform={_arch}",
+                "--platform=linux/arm64",
                 "-d",
                 DOCKER_IMAGE,
                 "sleep", "infinity",
