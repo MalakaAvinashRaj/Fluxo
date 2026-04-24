@@ -106,6 +106,7 @@ class SessionResponse(BaseModel):
     session_id: str
     user_id: Optional[str]
     created_at: str
+    phase: str = "idle"
 
 
 class PreviewRequest(BaseModel):
@@ -288,6 +289,7 @@ async def get_session(
         "created_at": session.created_at.isoformat(),
         "last_activity": session.last_activity.isoformat(),
         "is_active": session.is_active,
+        "phase": session.phase,
         "message_count": session.message_count,
         "messages": messages,
     }

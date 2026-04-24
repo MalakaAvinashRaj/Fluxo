@@ -211,6 +211,47 @@ Always focus on creating functional, visually appealing Flutter applications tha
 
             await self.memory.add_message("system", flutter_prompt)
         
+    async def _complexity_check(self, user_message: str) -> Dict[str, Any]:
+        """One cheap LLM call to decide if a request needs a planning conversation."""
+        prompt = f"""You are evaluating a Flutter app request to decide if upfront planning is needed.
+
+Request: "{user_message}"
+
+Classify as "simple" if the app is clearly a single-screen utility with no ambiguity (counter, timer, basic todo, calculator, color picker, stopwatch, etc.).
+Classify as "complex" if the app has multiple screens, charts, data relationships, real-time features, auth, or any ambiguity that benefits from clarification.
+
+Respond with valid JSON only — no markdown, no explanation:
+{{
+  "complexity": "simple",
+  "plan_summary": "one sentence describing what you will build",
+  "questions": []
+}}
+
+Or for complex:
+{{
+  "complexity": "complex",
+  "plan_summary": "one sentence describing what you will build",
+  "questions": ["specific question 1", "specific question 2"]
+}}
+
+Maximum 3 questions. Questions must be specific and directly affect how you build the app."""
+
+        try:
+            response = await self.llm_service.complete_chat(
+                messages=[{"role": "user", "content": prompt}],
+                tools=[]
+            )
+            content = response.get("content", "")
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+                if "complexity" in result:
+                    return result
+        except Exception as e:
+            logger.warning("Complexity check failed, defaulting to simple", error=str(e))
+
+        return {"complexity": "simple", "plan_summary": "", "questions": []}
+
     async def _planning_pass(self, user_message: str, is_new_project: bool) -> str:
         
         prompt = " "
@@ -264,22 +305,58 @@ Always focus on creating functional, visually appealing Flutter applications tha
             return
         
         self.is_processing = True
-        
+
         try:
             # Ensure Flutter system prompt is set
             await self._ensure_system_prompt()
-            
-            is_new_project = len(self.memory.messages) <= 1
-            
-            # Add user message to memory
+
+            # is_new_project = no Flutter code built yet (idle or mid-planning)
+            is_new_project = self.session.phase in ("idle", "planning")
+
+            # ── Planning Gate ────────────────────────────────────────────────────
+            if self.session.phase == "idle":
+                yield {"type": "status", "data": {"message": "Analyzing your request..."}}
+                check = await self._complexity_check(user_message)
+
+                if check["complexity"] == "complex" and check.get("questions"):
+                    # Complex request — enter planning phase
+                    self.session.phase = "planning"
+                    await self.memory.add_message("user", user_message)
+                    self.session.increment_message_count()
+
+                    # Store plan as an assistant turn so the LLM has full context later
+                    plan_text = (
+                        f"Plan: {check['plan_summary']}\n\n"
+                        + "\n".join(f"{i+1}. {q}" for i, q in enumerate(check["questions"]))
+                    )
+                    await self.memory.add_message("assistant", plan_text)
+
+                    yield {
+                        "type": "plan",
+                        "data": {
+                            "summary": check["plan_summary"],
+                            "questions": check["questions"],
+                        },
+                    }
+                    return  # wait for user's answers
+
+                # Simple request — skip planning, go straight to building
+                self.session.phase = "building"
+
+            elif self.session.phase == "planning":
+                # User just answered the planning questions
+                self.session.phase = "building"
+                yield {"type": "status", "data": {"message": "Got it! Starting to build..."}}
+
+            # ── Add user message and proceed to build ───────────────────────────
             await self.memory.add_message("user", user_message)
             self.session.increment_message_count()
-            
+
             yield {
                 "type": "status",
-                "data": {"message": "Processing request...", "autonomous": autonomous}
+                "data": {"message": "Processing request...", "autonomous": autonomous},
             }
-            
+
             # Proactively prepare Flutter container before AI processing
             # Block until container is confirmed ready before calling OpenAI
             container_info = await self._wait_for_container_ready()

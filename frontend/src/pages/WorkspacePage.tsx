@@ -18,9 +18,10 @@ type FileType = {
 
 export type ChatMessage = {
   id: string
-  role: "user" | "assistant"
+  role: "user" | "assistant" | "plan"
   content: string
   timestamp: Date
+  planData?: { summary: string; questions: string[] }
 }
 
 function stripCodeFences(text: string): string {
@@ -181,13 +182,29 @@ export default function WorkspacePage() {
     try {
       let proseAccum = ''
       const statusLines: string[] = []
+      let planReceived = false
 
       const updateMsg = (content: string) =>
         setMessages(prev => prev.map(m => m.id === assistantMsgId ? { ...m, content } : m))
 
       await apiService.sendMessageStream(activeSessionId, prompt, (chunk) => {
-        if (chunk.type === 'content') {
-          // Accumulate prose — don't update live (avoids streaming code to chat)
+        if (chunk.type === 'plan') {
+          // Replace the placeholder assistant message with a plan card
+          planReceived = true
+          setMessages(prev => prev.map(m =>
+            m.id === assistantMsgId
+              ? {
+                  ...m,
+                  role: 'plan' as const,
+                  content: chunk.data?.summary ?? '',
+                  planData: {
+                    summary: chunk.data?.summary ?? '',
+                    questions: chunk.data?.questions ?? [],
+                  },
+                }
+              : m
+          ))
+        } else if (chunk.type === 'content') {
           proseAccum += chunk.data
         } else if (chunk.type === 'status') {
           const msg: string = chunk.data?.message ?? ''
@@ -213,15 +230,16 @@ export default function WorkspacePage() {
         }
       })
 
-      // After streaming done: show final prose (stripped of code fences) if any
-      const finalProse = stripCodeFences(proseAccum).trim()
-      const hasBuildError = statusLines.some(l => l.startsWith('❌'))
-      if (finalProse && !hasBuildError) {
-        updateMsg(finalProse)
-      } else if (statusLines.length === 0) {
-        updateMsg('Done.')
+      // Plan event handled above — don't overwrite with prose
+      if (!planReceived) {
+        const finalProse = stripCodeFences(proseAccum).trim()
+        const hasBuildError = statusLines.some(l => l.startsWith('❌'))
+        if (finalProse && !hasBuildError) {
+          updateMsg(finalProse)
+        } else if (statusLines.length === 0) {
+          updateMsg('Done.')
+        }
       }
-      // If there were status/error lines and no prose, keep the status display
     } catch (error) {
       logger.error('Failed to send message:', error)
       setMessages(prev => prev.map(m =>

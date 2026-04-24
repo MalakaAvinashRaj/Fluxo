@@ -31,10 +31,13 @@ class Session:
         self.created_at = datetime.utcnow()
         self.last_activity = datetime.utcnow()
         self.is_active = True
-        
+
+        # Planning phase: "idle" → "planning" → "building"
+        self.phase = "idle"
+
         # Initialize memory manager
         self.memory = MemoryManager(session_id)
-        
+
         # Session statistics
         self.message_count = 0
         self.tool_calls_count = 0
@@ -73,6 +76,7 @@ class Session:
             "created_at": self.created_at.isoformat(),
             "last_activity": self.last_activity.isoformat(),
             "is_active": self.is_active,
+            "phase": self.phase,
             "message_count": self.message_count,
             "tool_calls_count": self.tool_calls_count,
             "error_count": self.error_count,
@@ -91,6 +95,7 @@ class Session:
         session.created_at = datetime.fromisoformat(data["created_at"])
         session.last_activity = datetime.fromisoformat(data["last_activity"])
         session.is_active = data.get("is_active", True)
+        session.phase = data.get("phase", "idle")
         session.message_count = data.get("message_count", 0)
         session.tool_calls_count = data.get("tool_calls_count", 0)
         session.error_count = data.get("error_count", 0)

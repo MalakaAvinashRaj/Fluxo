@@ -138,7 +138,7 @@ export function ChatPanel({ sessionId, isGenerating, messages, files, onSendMess
                 className={`flex flex-col gap-2 w-full ${group.role === 'user' ? 'items-end' : 'items-start'}`}
               >
                 {group.role === 'user' ? (
-                  /* User bubble — soft filled pill, no border */
+                  /* User bubble */
                   <div
                     className="max-w-[82%] px-3.5 py-2.5"
                     style={{
@@ -154,18 +154,62 @@ export function ChatPanel({ sessionId, isGenerating, messages, files, onSendMess
                       {message.content}
                     </p>
                   </div>
+                ) : group.role === 'plan' ? (
+                  /* Planning card */
+                  <div
+                    className="max-w-[96%] rounded-2xl p-4 flex flex-col gap-3"
+                    style={{
+                      backgroundColor: 'var(--surface-raised)',
+                      border: '1px solid var(--accent-border)',
+                    }}
+                  >
+                    {/* Header */}
+                    <div className="flex items-center gap-2">
+                      <Zap className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--accent)' }} />
+                      <span className="text-xs font-semibold uppercase tracking-wide" style={{ color: 'var(--accent)' }}>
+                        Planning
+                      </span>
+                    </div>
+
+                    {/* Plan summary */}
+                    {message.planData?.summary && (
+                      <p className="text-sm leading-relaxed" style={{ color: 'var(--text-1)' }}>
+                        {message.planData.summary}
+                      </p>
+                    )}
+
+                    {/* Questions */}
+                    {message.planData?.questions && message.planData.questions.length > 0 && (
+                      <div className="flex flex-col gap-2">
+                        <p className="text-xs font-medium" style={{ color: 'var(--text-3)' }}>
+                          A few quick questions before I build:
+                        </p>
+                        <ol className="flex flex-col gap-1.5 list-none">
+                          {message.planData.questions.map((q, i) => (
+                            <li key={i} className="flex gap-2 text-sm leading-relaxed" style={{ color: 'var(--text-2)' }}>
+                              <span className="shrink-0 font-medium" style={{ color: 'var(--accent)' }}>{i + 1}.</span>
+                              <span>{q}</span>
+                            </li>
+                          ))}
+                        </ol>
+                      </div>
+                    )}
+
+                    {/* Hint */}
+                    <p className="text-xs" style={{ color: 'var(--text-4)' }}>
+                      Answer below and I'll start building.
+                    </p>
+                  </div>
                 ) : (
-                  /* AI response — just text, no container */
+                  /* AI response — plain text */
                   <div className="max-w-[96%] flex flex-col gap-2.5">
                     {isErrorMessage(message.content) ? (
                       <div className="flex flex-col gap-2">
-                        {/* Show only the clean status lines — hide raw compiler errors */}
                         {message.content.split('\n')
                           .filter(l => !l.startsWith('❌') && !l.startsWith('Error:') && l.trim())
                           .map((line, i) => (
                             <p key={i} className="text-sm leading-relaxed" style={{ color: 'var(--text-2)' }}>{line}</p>
                           ))}
-                        {/* Friendly error notice */}
                         <div
                           className="flex items-center gap-2 px-3 py-2 rounded-xl mt-1"
                           style={{ backgroundColor: 'rgba(239,68,68,0.05)', borderLeft: '2px solid rgba(239,68,68,0.3)' }}
