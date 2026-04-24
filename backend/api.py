@@ -1,5 +1,6 @@
 """FastAPI backend for the autonomous agent system."""
 
+import asyncio
 import uuid
 import json
 from pathlib import Path
@@ -9,6 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import structlog
 
@@ -85,25 +87,69 @@ class ToolsResponse(BaseModel):
     count: int
 
 
+SESSION_TTL_DAYS = 7
+
+
+async def _hourly_container_restart(preview_service: FlutterPreviewService):
+    """Restart the Flutter build container every hour to free memory."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            logger.info("Hourly container restart starting")
+            await preview_service.start_build_container()
+            logger.info("Hourly container restart complete")
+        except Exception as e:
+            logger.error("Hourly container restart failed", error=str(e))
+
+
+async def _daily_session_cleanup(session_manager):
+    """Delete sessions older than SESSION_TTL_DAYS every 24 hours."""
+    from datetime import datetime, timezone
+    while True:
+        await asyncio.sleep(86400)
+        try:
+            sessions_path = Path(settings.session_storage_path)
+            if not sessions_path.exists():
+                continue
+            cutoff = datetime.now(timezone.utc).timestamp() - SESSION_TTL_DAYS * 86400
+            removed = 0
+            for f in sessions_path.glob("*.json"):
+                try:
+                    data = json.loads(f.read_text())
+                    created = datetime.fromisoformat(data.get("created_at", "")).timestamp()
+                    if created < cutoff:
+                        f.unlink(missing_ok=True)
+                        removed += 1
+                except Exception:
+                    pass
+            logger.info("Daily session cleanup done", removed=removed)
+        except Exception as e:
+            logger.error("Daily session cleanup failed", error=str(e))
+
+
 # Application lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan management."""
-    
+
     # Startup
     setup_logging()
-    
+
     if settings.enable_metrics:
         start_metrics_server(settings.metrics_port)
-    
+
     # Initialize components
     session_manager = get_session_manager()
     tool_registry = get_tool_registry()
-    
+
     # Initialize Flutter build service and start container
     app.state.preview_service = FlutterPreviewService()
     await app.state.preview_service.start_build_container()
-    
+
+    # Start background maintenance tasks
+    restart_task = asyncio.create_task(_hourly_container_restart(app.state.preview_service))
+    cleanup_task = asyncio.create_task(_daily_session_cleanup(session_manager))
+
     logger.info(
         "Agent API started",
         host=settings.host,
@@ -112,9 +158,12 @@ async def lifespan(app: FastAPI):
         metrics_enabled=settings.enable_metrics,
         available_tools=len(tool_registry.list_tools())
     )
-    
+
     yield
-    
+
+    restart_task.cancel()
+    cleanup_task.cancel()
+
     # Shutdown — stop container and delete all local data
     await session_manager.shutdown()
     await app.state.preview_service.shutdown()
@@ -272,12 +321,11 @@ async def my_sessions(
     sessions_data = session_manager.get_sessions_for_ip(ip)
     quota = session_manager.get_ip_quota(ip)
 
+    output_dir = app.state.preview_service.output_dir
     sessions_out = []
     for s in sessions_data:
         session_id = s.get("session_id", "")
-        # Check if a build exists on disk
-        from config import settings as cfg
-        build_path = Path(cfg.flutter_output_dir if hasattr(cfg, "flutter_output_dir") else "./flutter_output") / session_id / "build" / "web"
+        build_path = output_dir / session_id / "build" / "web"
         has_build = build_path.exists()
         sessions_out.append({
             "session_id": session_id,
@@ -787,9 +835,15 @@ async def websocket_endpoint(
         )
 
 
+# Serve React frontend — must be last so API routes take priority
+_static_dir = Path(__file__).parent / "static"
+if _static_dir.exists():
+    app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="frontend")
+
+
 if __name__ == "__main__":
     import uvicorn
-    
+
     uvicorn.run(
         app,
         host=settings.host,

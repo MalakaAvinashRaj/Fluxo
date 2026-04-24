@@ -1,0 +1,23 @@
+[Unit]
+Description=Fluxo Backend (FastAPI + Flutter build server)
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=raj
+WorkingDirectory=/opt/fluxo/backend
+EnvironmentFile=/opt/fluxo/backend/.env
+ExecStart=/opt/fluxo/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+
+# Give the Flutter container time to spin up before systemd considers the service failed
+TimeoutStartSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fluxo-backend
+
+[Install]
+WantedBy=multi-user.target
