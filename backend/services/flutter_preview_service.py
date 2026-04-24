@@ -14,7 +14,8 @@ logger = structlog.get_logger()
 _PREVIEW_BASE = os.environ.get("PREVIEW_BASE_URL", "http://localhost:8080")
 
 CONTAINER_NAME = "flutter-build-server"
-DOCKER_IMAGE = "flutter-dev-server:latest"
+DOCKER_IMAGE = os.environ.get("DOCKER_IMAGE", "flutter-dev-server:arm64")
+DOCKER_PLATFORM = os.environ.get("DOCKER_PLATFORM", "linux/arm64")
 PROJECTS_DIR = "/projects"
 
 
@@ -42,7 +43,7 @@ class FlutterBuildService:
             proc = await asyncio.create_subprocess_exec(
                 "docker", "run",
                 "--name", CONTAINER_NAME,
-                "--platform=linux/arm64",
+                f"--platform={DOCKER_PLATFORM}",
                 "-d",
                 DOCKER_IMAGE,
                 "sleep", "infinity",
