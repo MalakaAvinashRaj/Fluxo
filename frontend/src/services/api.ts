@@ -195,6 +195,31 @@ class ApiService {
     })
   }
 
+  async getMySessions(): Promise<{
+    sessions: Array<{
+      session_id: string
+      created_at: string
+      last_active: string
+      phase: string
+      message_count: number
+      has_build: boolean
+      preview_url: string | null
+    }>
+    quota: {
+      projects_used: number
+      projects_remaining: number
+      messages_limit: number
+    }
+  }> {
+    try {
+      const response = await this.fetchWithTimeout(`${this.baseURL}/my-sessions`)
+      if (!response.ok) return { sessions: [], quota: { projects_used: 0, projects_remaining: 4, messages_limit: 20 } }
+      return response.json()
+    } catch {
+      return { sessions: [], quota: { projects_used: 0, projects_remaining: 4, messages_limit: 20 } }
+    }
+  }
+
   async getSession(sessionId: string): Promise<SessionData> {
     return this.retryRequest(async () => {
       try {

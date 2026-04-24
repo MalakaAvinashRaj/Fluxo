@@ -2,10 +2,8 @@
 
 import uuid
 import json
-import time
-from collections import defaultdict, deque
 from pathlib import Path
-from typing import Dict, Any, Optional, AsyncGenerator, Tuple
+from typing import Dict, Any, Optional, AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
@@ -28,58 +26,19 @@ logger = structlog.get_logger()
 request_logger = RequestLogger()
 
 
-# ─── IP Rate Limiter ──────────────────────────────────────────────────────────
+# ─── IP helpers ───────────────────────────────────────────────────────────────
 
-class IPRateLimiter:
-    """Sliding-window rate limiter keyed by client IP."""
-
-    def __init__(self, max_requests: int, window_seconds: int):
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
-        self._windows: Dict[str, deque] = defaultdict(deque)
-
-    @staticmethod
-    def _get_ip(request: Request) -> str:
-        """Extract real client IP, honouring Cloudflare / reverse-proxy headers."""
-        for header in ("CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"):
-            val = request.headers.get(header)
-            if val:
-                return val.split(",")[0].strip()
-        return request.client.host if request.client else "unknown"
-
-    def check(self, request: Request) -> Tuple[bool, int]:
-        """
-        Returns (allowed, retry_after_seconds).
-        retry_after_seconds is 0 when allowed.
-        """
-        ip = self._get_ip(request)
-        now = time.monotonic()
-        window = self._windows[ip]
-
-        # Evict timestamps outside the rolling window
-        cutoff = now - self.window_seconds
-        while window and window[0] <= cutoff:
-            window.popleft()
-
-        if len(window) >= self.max_requests:
-            retry_after = int(window[0] + self.window_seconds - now) + 1
-            return False, retry_after
-
-        window.append(now)
-        return True, 0
+def _get_client_ip(request: Request) -> str:
+    """Extract real client IP, honouring Cloudflare / reverse-proxy headers."""
+    for header in ("CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"):
+        val = request.headers.get(header)
+        if val:
+            return val.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
-# 5 new sessions per IP per hour; 25 chat messages per IP per hour
-_session_limiter = IPRateLimiter(max_requests=5, window_seconds=3600)
-_chat_limiter    = IPRateLimiter(max_requests=25, window_seconds=3600)
-
-
-def _rate_limit_response(retry_after: int) -> JSONResponse:
-    return JSONResponse(
-        status_code=429,
-        content={"detail": "Rate limit exceeded. Please try again later."},
-        headers={"Retry-After": str(retry_after)},
-    )
+def _quota_exceeded_response(detail: str) -> JSONResponse:
+    return JSONResponse(status_code=429, content={"detail": detail})
 
 
 # Request/Response models
@@ -236,26 +195,28 @@ async def create_session(
 ):
     """Create a new agent session."""
 
-    allowed, retry_after = _session_limiter.check(http_request)
-    if not allowed:
-        logger.warning("Session rate limit hit", ip=IPRateLimiter._get_ip(http_request))
-        return _rate_limit_response(retry_after)
+    ip = _get_client_ip(http_request)
+
+    if not session_manager.check_can_create_session(ip):
+        logger.warning("Project quota hit", ip=ip)
+        return _quota_exceeded_response(
+            "You've reached the 4-project limit. Open an existing project to continue."
+        )
 
     try:
         session = await session_manager.create_session(
             user_id=request.user_id,
             metadata=request.metadata
         )
-        
+        session.creator_ip = ip
+        session_manager.record_session_for_ip(session.session_id, ip)
+        await session_manager._persist_session(session)
+
         return SessionResponse(
             session_id=session.session_id,
             user_id=session.user_id,
             created_at=session.created_at.isoformat(),
-            last_activity=session.last_activity.isoformat(),
-            is_active=session.is_active,
-            message_count=session.message_count,
-            tool_calls_count=session.tool_calls_count,
-            error_count=session.error_count
+            phase=session.phase,
         )
         
     except Exception as e:
@@ -266,6 +227,7 @@ async def create_session(
 @app.get("/sessions/{session_id}")
 async def get_session(
     session_id: str,
+    background_tasks: BackgroundTasks,
     session_manager: SessionManager = Depends(get_session_manager_dep)
 ):
     """Get session information including conversation history."""
@@ -274,6 +236,11 @@ async def get_session(
 
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # If the container project is gone (e.g. after restart) but we have saved
+    # source files, silently restore it in the background for future builds.
+    if session.build_count > 0 and session_id not in app.state.preview_service.initialized_projects:
+        background_tasks.add_task(app.state.preview_service.restore_project, session_id)
 
     history = await session.memory.get_conversation_history(max_messages=100)
     # Only include user/assistant turns (skip system messages)
@@ -292,6 +259,43 @@ async def get_session(
         "phase": session.phase,
         "message_count": session.message_count,
         "messages": messages,
+    }
+
+
+@app.get("/my-sessions")
+async def my_sessions(
+    http_request: Request,
+    session_manager: SessionManager = Depends(get_session_manager_dep)
+):
+    """Return all sessions and quota info for the requesting IP."""
+    ip = _get_client_ip(http_request)
+    sessions_data = session_manager.get_sessions_for_ip(ip)
+    quota = session_manager.get_ip_quota(ip)
+
+    sessions_out = []
+    for s in sessions_data:
+        session_id = s.get("session_id", "")
+        # Check if a build exists on disk
+        from config import settings as cfg
+        build_path = Path(cfg.flutter_output_dir if hasattr(cfg, "flutter_output_dir") else "./flutter_output") / session_id / "build" / "web"
+        has_build = build_path.exists()
+        sessions_out.append({
+            "session_id": session_id,
+            "created_at": s.get("created_at", ""),
+            "last_active": s.get("last_activity", ""),
+            "phase": s.get("phase", "idle"),
+            "message_count": quota["messages_by_session"].get(session_id, 0),
+            "has_build": has_build,
+            "preview_url": f"/preview/{session_id}/" if has_build else None,
+        })
+
+    return {
+        "sessions": sessions_out,
+        "quota": {
+            "projects_used": quota["projects_used"],
+            "projects_remaining": quota["projects_remaining"],
+            "messages_limit": quota["messages_limit"],
+        },
     }
 
 
@@ -319,10 +323,7 @@ async def chat(
 ):
     """Chat with the agent (non-streaming)."""
 
-    allowed, retry_after = _chat_limiter.check(http_request)
-    if not allowed:
-        logger.warning("Chat rate limit hit", ip=IPRateLimiter._get_ip(http_request), session_id=session_id)
-        return _rate_limit_response(retry_after)
+    ip = _get_client_ip(http_request)
 
     session = await session_manager.get_session(session_id)
     
@@ -366,30 +367,32 @@ async def chat_stream(
 ):
     """Chat with the agent (streaming)."""
 
-    allowed, retry_after = _chat_limiter.check(http_request)
-    if not allowed:
-        logger.warning("Chat stream rate limit hit", ip=IPRateLimiter._get_ip(http_request), session_id=session_id)
-        return _rate_limit_response(retry_after)
+    ip = _get_client_ip(http_request)
 
     session = await session_manager.get_session(session_id)
-    
+
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
+    if not session_manager.check_can_send_message(session_id, ip):
+        return _quota_exceeded_response(
+            "This project has reached the 20-message limit."
+        )
+
+    # Record message and bump counter before processing
+    session_manager.increment_ip_message_count(session_id, ip)
+
     agent = AutonomousAgent(session, preview_service=app.state.preview_service)
-    
+
     async def generate_response():
-        """Generate streaming response."""
-        
         async for chunk in agent.chat(
             user_message=request.message,
             stream=request.stream,
             autonomous=request.autonomous,
             max_iterations=request.max_iterations
         ):
-            # Format as Server-Sent Events
             yield f"data: {json.dumps(chunk)}\n\n"
-        
+
         yield "data: [DONE]\n\n"
     
     return StreamingResponse(

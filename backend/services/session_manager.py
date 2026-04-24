@@ -35,6 +35,9 @@ class Session:
         # Planning phase: "idle" → "planning" → "building"
         self.phase = "idle"
 
+        # IP that created this session
+        self.creator_ip: str = "unknown"
+
         # Initialize memory manager
         self.memory = MemoryManager(session_id)
 
@@ -42,6 +45,7 @@ class Session:
         self.message_count = 0
         self.tool_calls_count = 0
         self.error_count = 0
+        self.build_count = 0
         
     def update_activity(self):
         """Update last activity timestamp."""
@@ -77,9 +81,11 @@ class Session:
             "last_activity": self.last_activity.isoformat(),
             "is_active": self.is_active,
             "phase": self.phase,
+            "creator_ip": self.creator_ip,
             "message_count": self.message_count,
             "tool_calls_count": self.tool_calls_count,
             "error_count": self.error_count,
+            "build_count": self.build_count,
             "duration_minutes": self.get_duration_minutes()
         }
     
@@ -96,9 +102,11 @@ class Session:
         session.last_activity = datetime.fromisoformat(data["last_activity"])
         session.is_active = data.get("is_active", True)
         session.phase = data.get("phase", "idle")
+        session.creator_ip = data.get("creator_ip", "unknown")
         session.message_count = data.get("message_count", 0)
         session.tool_calls_count = data.get("tool_calls_count", 0)
         session.error_count = data.get("error_count", 0)
+        session.build_count = data.get("build_count", 0)
         
         return session
 
@@ -121,6 +129,122 @@ class SessionManager:
         self._cleanup_task = None
         self._start_cleanup_task()
     
+    # ── Quota limits ──────────────────────────────────────────────────────────
+    MAX_PROJECTS_PER_IP = 4
+    MAX_MESSAGES_PER_SESSION = 20
+
+    # ── IP index + quota helpers ──────────────────────────────────────────────
+
+    def _ip_index_path(self) -> Path:
+        return self.storage_path / "ip_index.json"
+
+    def _ip_quotas_path(self) -> Path:
+        return self.storage_path / "ip_quotas.json"
+
+    def _load_ip_index(self) -> Dict[str, List[str]]:
+        p = self._ip_index_path()
+        if p.exists():
+            try:
+                return json.loads(p.read_text())
+            except Exception:
+                pass
+        return {}
+
+    def _save_ip_index(self, index: Dict[str, List[str]]) -> None:
+        self._ip_index_path().write_text(json.dumps(index, indent=2))
+
+    def _load_ip_quotas(self) -> Dict[str, Any]:
+        p = self._ip_quotas_path()
+        if p.exists():
+            try:
+                return json.loads(p.read_text())
+            except Exception:
+                pass
+        return {}
+
+    def _save_ip_quotas(self, quotas: Dict[str, Any]) -> None:
+        self._ip_quotas_path().write_text(json.dumps(quotas, indent=2))
+
+    def get_ip_quota(self, ip: str) -> Dict[str, Any]:
+        """Return quota info for an IP: projects used, messages by session."""
+        quotas = self._load_ip_quotas()
+        entry = quotas.get(ip, {"projects": 0, "messages_by_session": {}})
+        return {
+            "projects_used": entry.get("projects", 0),
+            "projects_remaining": max(0, self.MAX_PROJECTS_PER_IP - entry.get("projects", 0)),
+            "messages_by_session": entry.get("messages_by_session", {}),
+            "messages_limit": self.MAX_MESSAGES_PER_SESSION,
+        }
+
+    def check_can_create_session(self, ip: str) -> bool:
+        """True if IP is under the 4-project hard cap."""
+        quota = self.get_ip_quota(ip)
+        return quota["projects_used"] < self.MAX_PROJECTS_PER_IP
+
+    def check_can_send_message(self, session_id: str, ip: str) -> bool:
+        """True if this session is under the 20-message hard cap."""
+        quota = self.get_ip_quota(ip)
+        used = quota["messages_by_session"].get(session_id, 0)
+        return used < self.MAX_MESSAGES_PER_SESSION
+
+    def record_session_for_ip(self, session_id: str, ip: str) -> None:
+        """Register a new session under an IP in both index and quotas files."""
+        # Update index
+        index = self._load_ip_index()
+        index.setdefault(ip, [])
+        if session_id not in index[ip]:
+            index[ip].append(session_id)
+        self._save_ip_index(index)
+
+        # Update quotas
+        quotas = self._load_ip_quotas()
+        entry = quotas.setdefault(ip, {"projects": 0, "messages_by_session": {}})
+        entry["projects"] = len(index[ip])
+        entry["messages_by_session"].setdefault(session_id, 0)
+        self._save_ip_quotas(quotas)
+
+    def increment_ip_message_count(self, session_id: str, ip: str) -> int:
+        """Bump message counter for this session. Returns new count."""
+        quotas = self._load_ip_quotas()
+        entry = quotas.setdefault(ip, {"projects": 0, "messages_by_session": {}})
+        entry["messages_by_session"].setdefault(session_id, 0)
+        entry["messages_by_session"][session_id] += 1
+        self._save_ip_quotas(quotas)
+        return entry["messages_by_session"][session_id]
+
+    def get_sessions_for_ip(self, ip: str) -> List[Dict[str, Any]]:
+        """Return metadata for all sessions created by this IP."""
+        index = self._load_ip_index()
+        session_ids = index.get(ip, [])
+        result = []
+        for sid in session_ids:
+            session_file = self.storage_path / f"session_{sid}.json"
+            if session_file.exists():
+                try:
+                    data = json.loads(session_file.read_text())
+                    result.append(data)
+                except Exception:
+                    pass
+        result.sort(key=lambda s: s.get("last_activity", ""), reverse=True)
+        return result
+
+    def remove_session_from_ip_index(self, session_id: str, ip: str) -> None:
+        """Remove a deleted session from the IP index and update quota count."""
+        index = self._load_ip_index()
+        if ip in index:
+            index[ip] = [s for s in index[ip] if s != session_id]
+            if not index[ip]:
+                del index[ip]
+        self._save_ip_index(index)
+
+        quotas = self._load_ip_quotas()
+        if ip in quotas:
+            quotas[ip]["projects"] = len(index.get(ip, []))
+            quotas[ip]["messages_by_session"].pop(session_id, None)
+        self._save_ip_quotas(quotas)
+
+    # ── Session lifecycle ─────────────────────────────────────────────────────
+
     async def create_session(
         self,
         user_id: Optional[str] = None,

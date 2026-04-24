@@ -4,8 +4,9 @@ import {
   ArrowUp, Clock, Trash2, Bookmark, BookmarkCheck, MoreVertical,
   Zap, Database, Search, Cpu, Layers, Github, Smartphone,
 } from 'lucide-react'
-import { getAllProjects, deleteProject, updateProject } from '../utils/projects'
+import { getAllProjects, deleteProject, updateProject, createProject, getProject } from '../utils/projects'
 import type { Project } from '../utils/projects'
+import { apiService } from '../services/api'
 
 const API = 'http://localhost:8080'
 
@@ -138,17 +139,51 @@ const UNDER_THE_HOOD = [
 const STACK = ['Python', 'FastAPI', 'OpenAI', 'ChromaDB', 'React', 'Docker', 'Flutter']
 const EXAMPLES = ['Counter app', 'Todo list', 'Weather UI', 'Calculator', 'Notes app']
 
+type ServerSession = {
+  session_id: string
+  created_at: string
+  last_active: string
+  phase: string
+  message_count: number
+  has_build: boolean
+  preview_url: string | null
+}
+
 export default function HomePage() {
   const navigate = useNavigate()
   const [prompt, setPrompt] = useState('')
   const [isStarting, setIsStarting] = useState(false)
   const [projects, setProjects] = useState<Project[]>(getAllProjects)
+  const [serverSessions, setServerSessions] = useState<ServerSession[]>([])
+  const [quota, setQuota] = useState({ projects_used: 0, projects_remaining: 4, messages_limit: 20 })
 
   const refresh = () => setProjects(getAllProjects())
 
   useEffect(() => {
     pruneStaleProjects().then(refresh)
+    apiService.getMySessions().then(({ sessions, quota: q }) => {
+      setServerSessions(sessions)
+      setQuota(q)
+    })
   }, [])
+
+  const handleContinueSession = (s: ServerSession) => {
+    // If we already have this session in local storage, go straight there
+    const existing = getAllProjects().find(p => p.sessionId === s.session_id)
+    if (existing) {
+      navigate(`/workspace/${existing.projectId}`)
+      return
+    }
+    // Otherwise create a local project entry so WorkspacePage can restore it
+    const projectId = s.session_id
+    if (!getProject(projectId)) {
+      createProject(projectId, s.session_id, `Project ${new Date(s.created_at).toLocaleDateString()}`)
+      if (s.preview_url) {
+        updateProject(projectId, { previewUrl: s.preview_url })
+      }
+    }
+    navigate(`/workspace/${projectId}`)
+  }
 
   const handleStart = async (e?: React.FormEvent) => {
     if (e) e.preventDefault()
@@ -277,6 +312,16 @@ export default function HomePage() {
               </div>
             </div>
           </form>
+
+          {/* Quota indicator */}
+          {quota.projects_used > 0 && (
+            <p className="text-center text-xs mb-4" style={{ color: 'var(--text-4)' }}>
+              <span style={{ color: quota.projects_remaining === 0 ? '#f87171' : 'var(--text-3)' }}>
+                {quota.projects_used} of 4 projects used
+              </span>
+              {quota.projects_remaining === 0 && ' · limit reached'}
+            </p>
+          )}
 
           {/* Example chips */}
           <div className="flex flex-wrap items-center justify-center gap-2">
@@ -411,6 +456,69 @@ export default function HomePage() {
           ))}
         </div>
       </section>
+
+      {/* ── Your previous projects (server-side, IP-based) ────────── */}
+      {serverSessions.length > 0 && (
+        <div className="px-6 py-10" style={{ borderTop: '1px solid var(--border)' }}>
+          <div className="max-w-4xl mx-auto">
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-2">
+                <Clock className="h-3 w-3" style={{ color: 'var(--text-3)' }} />
+                <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--text-3)' }}>
+                  Your previous projects
+                </span>
+              </div>
+              <span className="text-xs" style={{ color: 'var(--text-4)' }}>
+                {quota.projects_used} of 4 used
+              </span>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+              {serverSessions.map(s => (
+                <button
+                  key={s.session_id}
+                  onClick={() => handleContinueSession(s)}
+                  className="text-left rounded-xl p-3 transition-all duration-150 group"
+                  style={{ backgroundColor: 'var(--surface)', border: '1px solid var(--border)' }}
+                  onMouseEnter={e => {
+                    e.currentTarget.style.borderColor = 'var(--border-strong)'
+                    e.currentTarget.style.transform = 'translateY(-2px)'
+                    e.currentTarget.style.boxShadow = '0 6px 24px rgba(0,0,0,0.12)'
+                  }}
+                  onMouseLeave={e => {
+                    e.currentTarget.style.borderColor = 'var(--border)'
+                    e.currentTarget.style.transform = 'translateY(0)'
+                    e.currentTarget.style.boxShadow = 'none'
+                  }}
+                >
+                  {/* Preview indicator */}
+                  <div
+                    className="w-full h-12 rounded-lg mb-3 flex items-center justify-center"
+                    style={{ backgroundColor: 'var(--surface-raised)', border: '1px solid var(--border)' }}
+                  >
+                    {s.has_build
+                      ? <div className="flex items-center gap-1.5">
+                          <div className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'var(--accent)' }} />
+                          <span className="text-xs" style={{ color: 'var(--text-3)' }}>Built</span>
+                        </div>
+                      : <div className="w-1 h-1 rounded-full" style={{ backgroundColor: 'var(--border-strong)' }} />}
+                  </div>
+                  <p className="text-xs font-medium truncate mb-1" style={{ color: 'var(--text-2)' }}>
+                    {new Date(s.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                  </p>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs" style={{ color: 'var(--text-4)' }}>
+                      {timeAgo(s.last_active)}
+                    </span>
+                    <span className="text-xs" style={{ color: 'var(--text-4)' }}>
+                      {s.message_count}/20 msgs
+                    </span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Projects ─────────────────────────────────────────────── */}
       {projects.length > 0 && (

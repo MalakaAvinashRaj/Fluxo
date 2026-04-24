@@ -149,6 +149,46 @@ class FlutterBuildService:
             logger.error("Error initializing project", session_id=session_id, error=str(e), exc_info=True)
             yield {"phase": "error", "message": f"Project init failed: {str(e)}"}
 
+    async def restore_project(self, session_id: str) -> bool:
+        """Re-initialize a session's Flutter project using saved host source files.
+
+        Called silently in the background when a returning user's container project
+        is gone (after a periodic restart) but source files still exist on the host.
+        """
+        if not self.container_id:
+            return False
+
+        saved_main = self.output_dir / session_id / "lib" / "main.dart"
+        if not saved_main.exists():
+            logger.info("No saved source to restore", session_id=session_id)
+            return False
+
+        try:
+            async for event in self._init_project(session_id):
+                if event.get("phase") == "error":
+                    logger.warning("restore_project: init failed", session_id=session_id)
+                    return False
+
+            container_path = f"{PROJECTS_DIR}/{session_id}/lib/main.dart"
+            cp_proc = await asyncio.create_subprocess_exec(
+                "docker", "cp",
+                str(saved_main),
+                f"{CONTAINER_NAME}:{container_path}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await cp_proc.communicate()
+            if cp_proc.returncode != 0:
+                logger.warning("restore_project: cp failed", session_id=session_id, error=stderr.decode())
+                return False
+
+            logger.info("Project restored into container", session_id=session_id)
+            return True
+
+        except Exception as e:
+            logger.error("restore_project error", session_id=session_id, error=str(e))
+            return False
+
     async def build_project(self, session_id: str, files: List[Dict[str, str]]) -> Dict[str, Any]:
         """Write files to host, copy into container, build, copy output back."""
         try:
