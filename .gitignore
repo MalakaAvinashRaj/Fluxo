@@ -7,6 +7,7 @@
 
 # ── Claude Code (IDE config, not project files) ───────────────────────────────
 .claude/
+CLAUDE.md
 
 # ── preview-server (v1 — superseded by backend/) ─────────────────────────────
 preview-server/
