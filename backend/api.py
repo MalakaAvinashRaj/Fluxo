@@ -203,16 +203,6 @@ def get_session_manager_dep() -> SessionManager:
 
 
 # Routes
-@app.get("/")
-async def root():
-    """Root endpoint."""
-    return {
-        "message": "Autonomous Agent API",
-        "version": "1.0.0",
-        "status": "running"
-    }
-
-
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
