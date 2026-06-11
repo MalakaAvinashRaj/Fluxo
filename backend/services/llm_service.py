@@ -292,7 +292,7 @@ class AnthropicService(LLMService):
             raise LLMServiceError("Anthropic API key not provided", service="anthropic")
         
         self.client = anthropic.AsyncAnthropic(api_key=self.api_key)
-        self.default_model = "claude-3-sonnet-20240229"
+        self.default_model = "claude-haiku-4-5-20251001"
     
     async def complete_chat(
         self,
@@ -306,17 +306,48 @@ class AnthropicService(LLMService):
         async def _complete():
             model_name = model or self.default_model
             
-            # Convert OpenAI format to Anthropic format
+            # Convert OpenAI message format to Anthropic format.
+            # OpenAI uses role="tool" for tool results and attaches tool_calls to
+            # assistant messages; Anthropic uses tool_use/tool_result content blocks.
             system_message = None
             anthropic_messages = []
-            
+
             for msg in messages:
-                if msg["role"] == "system":
+                role = msg["role"]
+                if role == "system":
                     system_message = msg["content"]
+                elif role == "tool":
+                    # Tool result — wrap as a user turn with a tool_result block.
+                    anthropic_messages.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": msg.get("tool_call_id", ""),
+                            "content": msg.get("content") or ""
+                        }]
+                    })
+                elif role == "assistant" and msg.get("tool_calls"):
+                    # Assistant turn with tool calls — build mixed content blocks.
+                    content_blocks: List[Dict[str, Any]] = []
+                    if msg.get("content"):
+                        content_blocks.append({"type": "text", "text": msg["content"]})
+                    for tc in msg["tool_calls"]:
+                        fn = tc.get("function", {})
+                        try:
+                            inp = json.loads(fn.get("arguments", "{}"))
+                        except (json.JSONDecodeError, TypeError):
+                            inp = {}
+                        content_blocks.append({
+                            "type": "tool_use",
+                            "id": tc.get("id", ""),
+                            "name": fn.get("name", ""),
+                            "input": inp
+                        })
+                    anthropic_messages.append({"role": "assistant", "content": content_blocks})
                 else:
                     anthropic_messages.append({
-                        "role": msg["role"],
-                        "content": msg["content"]
+                        "role": role,
+                        "content": msg.get("content") or ""
                     })
             
             # Prepare request parameters
@@ -450,10 +481,6 @@ class AnthropicService(LLMService):
                 "type": "content",
                 "data": chunk
             }
-            
-            # Small delay to simulate streaming
-            import asyncio
-            await asyncio.sleep(0.01)
         
         # Yield tool calls if present
         if result.get("tool_calls"):

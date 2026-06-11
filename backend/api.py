@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import os
-import subprocess
+import re
 import uuid
 import json
 from pathlib import Path
@@ -34,17 +34,45 @@ request_logger = RequestLogger()
 
 # ─── IP helpers ───────────────────────────────────────────────────────────────
 
+# Only honour forwarded-IP headers when we are actually running behind a trusted
+# reverse proxy (Cloudflare / Nginx). Otherwise these headers are fully
+# client-controlled and would let anyone forge a fresh identity per request to
+# bypass per-IP quotas. Enable by setting TRUST_PROXY_HEADERS=1 in the
+# environment for the proxied deployment only.
+_TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "").lower() in ("1", "true", "yes")
+
+# Session IDs are UUID4; reject anything else early to keep them out of paths.
+_SESSION_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+
+
 def _get_client_ip(request: Request) -> str:
-    """Extract real client IP, honouring Cloudflare / reverse-proxy headers."""
-    for header in ("CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"):
-        val = request.headers.get(header)
-        if val:
-            return val.split(",")[0].strip()
+    """Extract the client IP.
+
+    Behind a trusted proxy we honour Cloudflare / forwarding headers; otherwise
+    we use the direct peer address so the value cannot be spoofed.
+    """
+    if _TRUST_PROXY_HEADERS:
+        for header in ("CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"):
+            val = request.headers.get(header)
+            if val:
+                return val.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
 def _quota_exceeded_response(detail: str) -> JSONResponse:
     return JSONResponse(status_code=429, content={"detail": detail})
+
+
+def _verify_session_owner(session, ip: str) -> None:
+    """Ensure the requesting IP owns this session, else 404.
+
+    We return 404 (not 403) so the existence of another user's session is not
+    revealed. Sessions created before ownership tracking carry "unknown" and are
+    treated as legacy-open to avoid locking users out after deploy.
+    """
+    owner = getattr(session, "creator_ip", "unknown")
+    if owner not in ("unknown", ip):
+        raise HTTPException(status_code=404, detail="Session not found")
 
 
 # Request/Response models
@@ -72,18 +100,6 @@ class SessionResponse(BaseModel):
     user_id: Optional[str]
     created_at: str
     phase: str = "idle"
-
-
-class PreviewRequest(BaseModel):
-    files: list[Dict[str, str]] = Field(..., description="Flutter project files")
-
-
-class PreviewResponse(BaseModel):
-    success: bool
-    sessionId: Optional[str] = None
-    port: Optional[int] = None
-    previewUrl: Optional[str] = None
-    message: str
 
 
 class ToolsResponse(BaseModel):
@@ -117,12 +133,23 @@ async def _daily_session_cleanup(session_manager):
                 continue
             cutoff = datetime.now(timezone.utc).timestamp() - SESSION_TTL_DAYS * 86400
             removed = 0
-            for f in sessions_path.glob("*.json"):
+            # Only iterate session-metadata files (session_<id>.json), which carry
+            # created_at. Skip the IP index/quota files and the memory files
+            # (<id>.json) — the latter are removed alongside their metadata file.
+            for f in sessions_path.glob("session_*.json"):
                 try:
                     data = json.loads(f.read_text())
-                    created = datetime.fromisoformat(data.get("created_at", "")).timestamp()
+                    created_raw = data.get("created_at")
+                    if not created_raw:
+                        continue
+                    created = datetime.fromisoformat(created_raw).timestamp()
                     if created < cutoff:
+                        session_id = data.get("session_id") or f.stem[len("session_"):]
+                        # Remove metadata file, paired memory file, and quota entry.
                         f.unlink(missing_ok=True)
+                        (sessions_path / f"{session_id}.json").unlink(missing_ok=True)
+                        creator_ip = data.get("creator_ip", "unknown")
+                        await session_manager.remove_session_from_ip_index(session_id, creator_ip)
                         removed += 1
                 except Exception:
                     pass
@@ -240,7 +267,7 @@ async def create_session(
 
     ip = _get_client_ip(http_request)
 
-    if not session_manager.check_can_create_session(ip):
+    if not await session_manager.check_can_create_session(ip):
         logger.warning("Project quota hit", ip=ip)
         return _quota_exceeded_response(
             "You've reached the 4-project limit. Open an existing project to continue."
@@ -252,7 +279,7 @@ async def create_session(
             metadata=request.metadata
         )
         session.creator_ip = ip
-        session_manager.record_session_for_ip(session.session_id, ip)
+        await session_manager.record_session_for_ip(session.session_id, ip)
         await session_manager._persist_session(session)
 
         return SessionResponse(
@@ -270,6 +297,7 @@ async def create_session(
 @app.get("/sessions/{session_id}")
 async def get_session(
     session_id: str,
+    http_request: Request,
     background_tasks: BackgroundTasks,
     session_manager: SessionManager = Depends(get_session_manager_dep)
 ):
@@ -279,6 +307,8 @@ async def get_session(
 
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    _verify_session_owner(session, _get_client_ip(http_request))
 
     # If the container project is gone (e.g. after restart) but we have saved
     # source files, silently restore it in the background for future builds.
@@ -344,15 +374,21 @@ async def my_sessions(
 @app.delete("/sessions/{session_id}")
 async def end_session(
     session_id: str,
+    http_request: Request,
     session_manager: SessionManager = Depends(get_session_manager_dep)
 ):
     """End a session."""
-    
+
+    session = await session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _verify_session_owner(session, _get_client_ip(http_request))
+
     success = await session_manager.end_session(session_id)
-    
+
     if not success:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     return {"message": "Session ended successfully"}
 
 
@@ -368,12 +404,22 @@ async def chat(
     ip = _get_client_ip(http_request)
 
     session = await session_manager.get_session(session_id)
-    
+
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
+    _verify_session_owner(session, ip)
+
+    if not await session_manager.check_can_send_message(session_id, ip):
+        return _quota_exceeded_response(
+            "This project has reached the 20-message limit."
+        )
+
+    # Record message and bump counter before processing
+    await session_manager.increment_ip_message_count(session_id, ip)
+
     agent = AutonomousAgent(session, preview_service=app.state.preview_service)
-    
+
     # Collect all responses
     full_response = ""
     tool_calls_count = 0
@@ -416,13 +462,15 @@ async def chat_stream(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if not session_manager.check_can_send_message(session_id, ip):
+    _verify_session_owner(session, ip)
+
+    if not await session_manager.check_can_send_message(session_id, ip):
         return _quota_exceeded_response(
             "This project has reached the 20-message limit."
         )
 
     # Record message and bump counter before processing
-    session_manager.increment_ip_message_count(session_id, ip)
+    await session_manager.increment_ip_message_count(session_id, ip)
 
     agent = AutonomousAgent(session, preview_service=app.state.preview_service)
 
@@ -470,17 +518,20 @@ async def get_tools():
 @app.get("/sessions/{session_id}/context")
 async def get_context(
     session_id: str,
+    http_request: Request,
     session_manager: SessionManager = Depends(get_session_manager_dep)
 ):
     """Get conversation context for a session."""
-    
+
     session = await session_manager.get_session(session_id)
-    
+
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
+    _verify_session_owner(session, _get_client_ip(http_request))
+
     agent = AutonomousAgent(session, preview_service=app.state.preview_service)
-    
+
     try:
         context = await agent.get_context_summary()
         conversation = await session.memory.get_conversation_history(max_messages=50)
@@ -498,18 +549,21 @@ async def get_context(
 @app.delete("/sessions/{session_id}/context")
 async def clear_context(
     session_id: str,
+    http_request: Request,
     keep_system: bool = True,
     session_manager: SessionManager = Depends(get_session_manager_dep)
 ):
     """Clear conversation context for a session."""
-    
+
     session = await session_manager.get_session(session_id)
-    
+
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
+    _verify_session_owner(session, _get_client_ip(http_request))
+
     agent = AutonomousAgent(session, preview_service=app.state.preview_service)
-    
+
     success = await agent.clear_context(keep_system_messages=keep_system)
     
     if not success:
@@ -549,6 +603,7 @@ async def get_statistics(
 @app.get("/sessions/{session_id}/warmup")
 async def warmup_session(
     session_id: str,
+    http_request: Request,
     session_manager: SessionManager = Depends(get_session_manager_dep)
 ):
     """Start Flutter container warmup and stream phase events via SSE."""
@@ -556,6 +611,8 @@ async def warmup_session(
     session = await session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    _verify_session_owner(session, _get_client_ip(http_request))
 
     preview_service: FlutterPreviewService = app.state.preview_service
 
@@ -577,12 +634,14 @@ async def warmup_session(
 @app.post("/sessions/{session_id}/pin")
 async def pin_session(
     session_id: str,
+    http_request: Request,
     session_manager: SessionManager = Depends(get_session_manager_dep)
 ):
     """Pin a session so its data survives server shutdown."""
     session = await session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    _verify_session_owner(session, _get_client_ip(http_request))
     app.state.preview_service.pin_session(session_id)
     return {"success": True, "pinned": True}
 
@@ -590,12 +649,14 @@ async def pin_session(
 @app.delete("/sessions/{session_id}/pin")
 async def unpin_session(
     session_id: str,
+    http_request: Request,
     session_manager: SessionManager = Depends(get_session_manager_dep)
 ):
     """Unpin a session — it will be cleaned up on next shutdown."""
     session = await session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    _verify_session_owner(session, _get_client_ip(http_request))
     app.state.preview_service.unpin_session(session_id)
     return {"success": True, "pinned": False}
 
@@ -603,10 +664,20 @@ async def unpin_session(
 @app.delete("/sessions/{session_id}/full")
 async def delete_session_full(
     session_id: str,
+    http_request: Request,
     session_manager: SessionManager = Depends(get_session_manager_dep)
 ):
     """Fully delete a session and all its data (Docker + host + session storage)."""
+    ip = _get_client_ip(http_request)
+    session = await session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _verify_session_owner(session, ip)
+
+    creator_ip = getattr(session, "creator_ip", "unknown")
     await session_manager.end_session(session_id)
+    # Free the IP's project-quota slot so deletion actually reclaims capacity.
+    await session_manager.remove_session_from_ip_index(session_id, creator_ip)
     success = await app.state.preview_service.delete_session(session_id)
     return {"success": success}
 
@@ -614,12 +685,15 @@ async def delete_session_full(
 @app.post("/sessions/{session_id}/rebuild")
 async def rebuild_preview(
     session_id: str,
+    http_request: Request,
     session_manager: SessionManager = Depends(get_session_manager_dep)
 ):
     """Re-run flutter build web for an existing session without uploading new files."""
     session = await session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    _verify_session_owner(session, _get_client_ip(http_request))
 
     preview_service: FlutterPreviewService = app.state.preview_service
     result = await preview_service.rebuild_project(session_id)
@@ -630,94 +704,22 @@ async def rebuild_preview(
 @app.get("/preview/{session_id}/{path:path}")
 async def serve_preview(session_id: str, path: str = ""):
     """Serve the static Flutter web build for a session."""
-    build_dir = Path(f"./flutter_output/{session_id}/build/web")
-    file_path = build_dir / (path if path else "index.html")
+    # Guard against path traversal: the resolved target must stay inside the
+    # session's build directory. session_id is also constrained to a UUID shape
+    # so it can't be used to climb out via "..".
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(status_code=404, detail="Preview not found")
 
-    if not file_path.exists():
+    build_dir = (Path("./flutter_output") / session_id / "build" / "web").resolve()
+    file_path = (build_dir / (path if path else "index.html")).resolve()
+
+    if not (file_path == build_dir or build_dir in file_path.parents):
+        raise HTTPException(status_code=404, detail="Preview not found")
+
+    if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Preview not ready — build may still be in progress")
 
     return FileResponse(file_path)
-
-
-# Flutter Preview Endpoints
-@app.post("/live-preview", response_model=PreviewResponse)
-async def create_live_preview(request: PreviewRequest):
-    """Create a new Flutter live preview session."""
-    
-    try:
-        preview_service: FlutterPreviewService = app.state.preview_service
-        result = await preview_service.create_session(request.files)
-        
-        logger.info("Live preview request", file_count=len(request.files))
-        
-        return PreviewResponse(**result)
-        
-    except Exception as e:
-        logger.error("Failed to create live preview", error=str(e), exc_info=True)
-        return PreviewResponse(
-            success=False,
-            message=f"Failed to create preview: {str(e)}"
-        )
-
-
-@app.get("/preview/{session_id}/status")
-async def get_preview_status(session_id: str):
-    """Get status of a preview session."""
-    
-    try:
-        preview_service: FlutterPreviewService = app.state.preview_service
-        status = await preview_service.get_session_status(session_id)
-        
-        if not status:
-            raise HTTPException(status_code=404, detail="Preview session not found")
-        
-        return status
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Failed to get preview status", session_id=session_id, error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to get preview status")
-
-
-@app.delete("/preview/{session_id}")
-async def stop_preview(session_id: str):
-    """Stop a preview session."""
-    
-    try:
-        preview_service: FlutterPreviewService = app.state.preview_service
-        success = await preview_service.stop_session(session_id)
-        
-        if not success:
-            raise HTTPException(status_code=404, detail="Preview session not found")
-        
-        return {"success": True, "message": f"Preview session {session_id} stopped"}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Failed to stop preview", session_id=session_id, error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to stop preview")
-
-
-@app.post("/preview/{session_id}/heartbeat")
-async def preview_heartbeat(session_id: str):
-    """Send heartbeat to keep preview session alive."""
-    
-    try:
-        preview_service: FlutterPreviewService = app.state.preview_service
-        success = await preview_service.send_heartbeat(session_id)
-        
-        if not success:
-            raise HTTPException(status_code=404, detail="Preview session not found")
-        
-        return {"success": True, "message": "Heartbeat sent"}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Failed to send heartbeat", session_id=session_id, error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to send heartbeat")
 
 
 # WebSocket endpoint for real-time communication
@@ -730,15 +732,46 @@ async def websocket_endpoint(
     """WebSocket endpoint for real-time agent communication."""
     
     await websocket.accept()
-    
+
+    # Resolve the client IP for quota + ownership, mirroring the HTTP path.
+    ws_ip = "unknown"
+    if _TRUST_PROXY_HEADERS:
+        for header in ("cf-connecting-ip", "x-forwarded-for", "x-real-ip"):
+            val = websocket.headers.get(header)
+            if val:
+                ws_ip = val.split(",")[0].strip()
+                break
+    if ws_ip == "unknown" and websocket.client:
+        ws_ip = websocket.client.host
+
     try:
         # Get or create session
         session = await session_manager.get_session(session_id)
-        
+
         if not session:
-            # Create new session
+            # New session: enforce the per-IP project cap and record ownership.
+            if not await session_manager.check_can_create_session(ws_ip):
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "data": {"error": "Project limit reached"}
+                }))
+                await websocket.close()
+                return
             session = await session_manager.create_session()
-        
+            session.creator_ip = ws_ip
+            await session_manager.record_session_for_ip(session.session_id, ws_ip)
+            await session_manager._persist_session(session)
+        else:
+            # Existing session must belong to the connecting IP.
+            owner = getattr(session, "creator_ip", "unknown")
+            if owner not in ("unknown", ws_ip):
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "data": {"error": "Session not found"}
+                }))
+                await websocket.close()
+                return
+
         agent = AutonomousAgent(session, preview_service=app.state.preview_service)
         
         logger.info(
@@ -756,11 +789,20 @@ async def websocket_endpoint(
                 message_type = message_data.get("type")
                 
                 if message_type == "chat":
+                    # Enforce the per-session message cap before processing.
+                    if not await session_manager.check_can_send_message(session.session_id, ws_ip):
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "data": {"error": "This project has reached the 20-message limit."}
+                        }))
+                        continue
+                    await session_manager.increment_ip_message_count(session.session_id, ws_ip)
+
                     # Process chat message
                     user_message = message_data.get("message", "")
                     autonomous = message_data.get("autonomous", True)
                     max_iterations = message_data.get("max_iterations", 10)
-                    
+
                     # Stream response back to client
                     async for chunk in agent.chat(
                         user_message=user_message,
@@ -811,9 +853,9 @@ async def websocket_endpoint(
                 
                 await websocket.send_text(json.dumps({
                     "type": "error",
-                    "data": {"error": str(e)}
+                    "data": {"error": "Internal error processing message"}
                 }))
-    
+
     except WebSocketDisconnect:
         logger.info(
             "WebSocket connection closed",
@@ -857,13 +899,18 @@ async def github_webhook(http_request: Request, background_tasks: BackgroundTask
     """Receive GitHub push events and trigger an auto-deploy."""
     body = await http_request.body()
 
+    # Fail closed: without a configured secret we cannot authenticate the sender,
+    # so refuse rather than allowing anyone to trigger a deploy.
+    if not _WEBHOOK_SECRET:
+        logger.error("Webhook rejected: GITHUB_WEBHOOK_SECRET is not configured")
+        raise HTTPException(status_code=503, detail="Webhook not configured")
+
     # Verify signature
-    if _WEBHOOK_SECRET:
-        sig_header = http_request.headers.get("X-Hub-Signature-256", "")
-        mac = hmac.new(_WEBHOOK_SECRET.encode(), body, hashlib.sha256)
-        expected = "sha256=" + mac.hexdigest()
-        if not hmac.compare_digest(sig_header, expected):
-            raise HTTPException(status_code=401, detail="Invalid signature")
+    sig_header = http_request.headers.get("X-Hub-Signature-256", "")
+    mac = hmac.new(_WEBHOOK_SECRET.encode(), body, hashlib.sha256)
+    expected = "sha256=" + mac.hexdigest()
+    if not hmac.compare_digest(sig_header, expected):
+        raise HTTPException(status_code=401, detail="Invalid signature")
 
     event = http_request.headers.get("X-GitHub-Event", "")
     if event == "push":

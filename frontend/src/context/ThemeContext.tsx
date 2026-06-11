@@ -13,4 +13,4 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   )
 }
 
-export const useTheme = () => useContext(ThemeContext)
+const useTheme = () => useContext(ThemeContext)

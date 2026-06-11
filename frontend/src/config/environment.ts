@@ -10,7 +10,7 @@ export const ENV = {
 } as const
 
 export const isProduction = ENV.NODE_ENV === 'production'
-export const isDevelopment = ENV.NODE_ENV === 'development'
+const isDevelopment = ENV.NODE_ENV === 'development'
 
 export const validateEnvironment = () => {
   // API_BASE_URL is intentionally empty in production (same-origin via Nginx)

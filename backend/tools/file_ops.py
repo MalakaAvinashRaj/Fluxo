@@ -14,6 +14,21 @@ from errors.exceptions import ToolExecutionError
 logger = structlog.get_logger()
 
 
+# All agent file access is confined to this sandbox root. It deliberately does
+# NOT include the backend source tree (which holds .env and secrets) or the
+# user's home directory. Override with AGENT_SANDBOX_DIR for custom deployments.
+SANDBOX_ROOT = Path(os.environ.get("AGENT_SANDBOX_DIR", "./flutter_output")).resolve()
+
+
+def _within_sandbox(path: Path) -> bool:
+    """True only if the resolved path is inside the sandbox root."""
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return False
+    return resolved == SANDBOX_ROOT or SANDBOX_ROOT in resolved.parents
+
+
 class ReadFileTool(BaseTool):
     """Tool for reading file contents."""
     
@@ -156,25 +171,8 @@ class ReadFileTool(BaseTool):
             )
     
     def _is_path_allowed(self, path: Path) -> bool:
-        """Check if path is within allowed directories."""
-        
-        # For now, allow all paths within the current working directory and its subdirectories
-        # In production, this should be more restrictive
-        try:
-            cwd = Path.cwd()
-            path.resolve().relative_to(cwd.resolve())
-            return True
-        except ValueError:
-            # Path is outside current working directory
-            # Allow common system paths for development
-            allowed_patterns = [
-                "/tmp/",
-                "/var/tmp/",
-                str(Path.home()),
-            ]
-            
-            path_str = str(path)
-            return any(path_str.startswith(pattern) for pattern in allowed_patterns)
+        """Check if path is within the agent sandbox."""
+        return _within_sandbox(path)
 
 
 class WriteFileTool(BaseTool):
@@ -300,21 +298,8 @@ class WriteFileTool(BaseTool):
             )
     
     def _is_path_allowed(self, path: Path) -> bool:
-        """Check if path is within allowed directories."""
-        # Same logic as ReadFileTool
-        try:
-            cwd = Path.cwd()
-            path.resolve().relative_to(cwd.resolve())
-            return True
-        except ValueError:
-            allowed_patterns = [
-                "/tmp/",
-                "/var/tmp/",
-                str(Path.home()),
-            ]
-            
-            path_str = str(path)
-            return any(path_str.startswith(pattern) for pattern in allowed_patterns)
+        """Check if path is within the agent sandbox."""
+        return _within_sandbox(path)
 
 
 class SearchFilesTool(BaseTool):
@@ -379,7 +364,15 @@ class SearchFilesTool(BaseTool):
         try:
             # Resolve search path
             base_path = Path(search_path).resolve()
-            
+
+            # Confine searches to the sandbox so the agent can't enumerate the host.
+            if not _within_sandbox(base_path):
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error=f"Access denied: Path '{base_path}' is not in allowed directories"
+                )
+
             if not base_path.exists():
                 return ToolResult(
                     success=False,
