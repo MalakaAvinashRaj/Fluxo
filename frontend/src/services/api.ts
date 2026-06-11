@@ -1,6 +1,42 @@
 import { ENV } from '../config/environment'
 import { Logger } from '../utils/logger'
 
+function throwIfRateLimited(response: Response, message: string): void {
+  if (response.status === 429) {
+    const retryAfter = response.headers.get('Retry-After') ?? '60'
+    throw new ApiError(
+      `${message} Please wait ${Math.ceil(Number(retryAfter) / 60)} minute(s) before trying again.`,
+      'RATE_LIMITED',
+      429
+    )
+  }
+}
+
+async function readSseStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  onChunk: (data: string) => void
+): Promise<void> {
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+
+    for (const line of lines) {
+      if (line.trim().startsWith('data: ')) {
+        const data = line.trim().substring(6)
+        if (data === '[DONE]') return
+        onChunk(data)
+      }
+    }
+  }
+}
+
 export class ApiError extends Error {
   status?: number
   code?: string
@@ -15,14 +51,14 @@ export class ApiError extends Error {
   }
 }
 
-export interface ApiResponse<T = unknown> {
+interface ApiResponse<T = unknown> {
   data: T
   success: boolean
   message?: string
   timestamp: string
 }
 
-export type SessionData = {
+type SessionData = {
   session_id: string
   user_id: string
   created_at: string
@@ -30,13 +66,13 @@ export type SessionData = {
   message_count: number
 }
 
-export interface ChatRequest {
+interface ChatRequest {
   message: string
   autonomous?: boolean
   stream?: boolean
 }
 
-export interface ChatResponse {
+interface ChatResponse {
   response: string
   tool_calls?: number
   session_id: string
@@ -173,14 +209,7 @@ class ApiService {
           body: JSON.stringify({ user_id: userId }),
         })
 
-        if (response.status === 429) {
-          const retryAfter = response.headers.get('Retry-After') ?? '60'
-          throw new ApiError(
-            `Too many sessions created. Please wait ${Math.ceil(Number(retryAfter) / 60)} minute(s) before trying again.`,
-            'RATE_LIMITED',
-            429
-          )
-        }
+        throwIfRateLimited(response, 'Too many sessions created.')
 
         if (!response.ok) {
           throw new Error(`Failed to create session: ${response.status} ${response.statusText}`)
@@ -276,14 +305,7 @@ class ApiService {
           }),
         })
 
-        if (response.status === 429) {
-          const retryAfter = response.headers.get('Retry-After') ?? '60'
-          throw new ApiError(
-            `Rate limit reached. Please wait ${Math.ceil(Number(retryAfter) / 60)} minute(s) before sending more messages.`,
-            'RATE_LIMITED',
-            429
-          )
-        }
+        throwIfRateLimited(response, 'Rate limit reached.')
 
         if (!response.ok) {
           throw new Error(`Failed to send message: ${response.status} ${response.statusText}`)
@@ -294,34 +316,14 @@ class ApiService {
           throw new Error('No response body reader available')
         }
 
-        const decoder = new TextDecoder()
-        let buffer = ''
-
-        while (true) {
-          const { done, value } = await reader.read()
-          
-          if (done) break
-
-          buffer += decoder.decode(value, { stream: true })
-          const lines = buffer.split('\n')
-          buffer = lines.pop() || ''
-
-          for (const line of lines) {
-            if (line.trim().startsWith('data: ')) {
-              const data = line.trim().substring(6)
-              if (data === '[DONE]') {
-                return
-              }
-              
-              try {
-                const chunk = JSON.parse(data)
-                onChunk(chunk)
-              } catch (e) {
-                this.logger.warn('Failed to parse chunk:', data)
-              }
-            }
+        await readSseStream(reader, (data) => {
+          try {
+            const chunk = JSON.parse(data)
+            onChunk(chunk)
+          } catch {
+            this.logger.warn('Failed to parse chunk:', data)
           }
-        }
+        })
       } catch (error) {
         throw this.handleApiError(error, 'sendMessageStream')
       }
@@ -347,30 +349,14 @@ class ApiService {
       const reader = response.body?.getReader()
       if (!reader) throw new Error('No response body reader available')
 
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
-        for (const line of lines) {
-          if (line.trim().startsWith('data: ')) {
-            const data = line.trim().substring(6)
-            if (data === '[DONE]') return
-            try {
-              const event = JSON.parse(data)
-              onPhase(event)
-            } catch {
-              // ignore malformed chunks
-            }
-          }
+      await readSseStream(reader, (data) => {
+        try {
+          const event = JSON.parse(data)
+          onPhase(event)
+        } catch {
+          // ignore malformed chunks
         }
-      }
+      })
     } catch (error) {
       throw this.handleApiError(error, 'warmupSession')
     }

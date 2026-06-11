@@ -1,6 +1,6 @@
 import { ENV, isProduction } from '../config/environment'
 
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
+type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
 export class Logger {
   private context: string
@@ -67,10 +67,6 @@ export class Logger {
           break
       }
     }
-  }
-
-  debug(message: string, ...args: unknown[]): void {
-    this.formatMessage('debug', message, ...args)
   }
 
   info(message: string, ...args: unknown[]): void {

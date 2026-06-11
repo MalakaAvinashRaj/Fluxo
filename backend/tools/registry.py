@@ -274,12 +274,10 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
     try:
         # Import and register built-in tools
         from .file_ops import ReadFileTool, WriteFileTool, SearchFilesTool
-        from .command import RunCommandTool
-        
+
         registry.register_tool(ReadFileTool())
         registry.register_tool(WriteFileTool())
         registry.register_tool(SearchFilesTool())
-        registry.register_tool(RunCommandTool())
         
         logger.info(
             "Built-in tools registered successfully",

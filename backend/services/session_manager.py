@@ -120,7 +120,10 @@ class SessionManager:
         
         # In-memory session cache
         self._sessions: Dict[str, Session] = {}
-        
+
+        # Protects concurrent read-modify-write on ip_index.json / ip_quotas.json
+        self._quota_lock: asyncio.Lock = asyncio.Lock()
+
         # Session cleanup settings
         self.session_timeout_hours = 24
         self.cleanup_interval_minutes = 30
@@ -176,41 +179,45 @@ class SessionManager:
             "messages_limit": self.MAX_MESSAGES_PER_SESSION,
         }
 
-    def check_can_create_session(self, ip: str) -> bool:
+    async def check_can_create_session(self, ip: str) -> bool:
         """True if IP is under the 4-project hard cap."""
-        quota = self.get_ip_quota(ip)
-        return quota["projects_used"] < self.MAX_PROJECTS_PER_IP
+        async with self._quota_lock:
+            quota = self.get_ip_quota(ip)
+            return quota["projects_used"] < self.MAX_PROJECTS_PER_IP
 
-    def check_can_send_message(self, session_id: str, ip: str) -> bool:
+    async def check_can_send_message(self, session_id: str, ip: str) -> bool:
         """True if this session is under the 20-message hard cap."""
-        quota = self.get_ip_quota(ip)
-        used = quota["messages_by_session"].get(session_id, 0)
-        return used < self.MAX_MESSAGES_PER_SESSION
+        async with self._quota_lock:
+            quota = self.get_ip_quota(ip)
+            used = quota["messages_by_session"].get(session_id, 0)
+            return used < self.MAX_MESSAGES_PER_SESSION
 
-    def record_session_for_ip(self, session_id: str, ip: str) -> None:
+    async def record_session_for_ip(self, session_id: str, ip: str) -> None:
         """Register a new session under an IP in both index and quotas files."""
-        # Update index
-        index = self._load_ip_index()
-        index.setdefault(ip, [])
-        if session_id not in index[ip]:
-            index[ip].append(session_id)
-        self._save_ip_index(index)
+        async with self._quota_lock:
+            # Update index
+            index = self._load_ip_index()
+            index.setdefault(ip, [])
+            if session_id not in index[ip]:
+                index[ip].append(session_id)
+            self._save_ip_index(index)
 
-        # Update quotas
-        quotas = self._load_ip_quotas()
-        entry = quotas.setdefault(ip, {"projects": 0, "messages_by_session": {}})
-        entry["projects"] = len(index[ip])
-        entry["messages_by_session"].setdefault(session_id, 0)
-        self._save_ip_quotas(quotas)
+            # Update quotas
+            quotas = self._load_ip_quotas()
+            entry = quotas.setdefault(ip, {"projects": 0, "messages_by_session": {}})
+            entry["projects"] = len(index[ip])
+            entry["messages_by_session"].setdefault(session_id, 0)
+            self._save_ip_quotas(quotas)
 
-    def increment_ip_message_count(self, session_id: str, ip: str) -> int:
+    async def increment_ip_message_count(self, session_id: str, ip: str) -> int:
         """Bump message counter for this session. Returns new count."""
-        quotas = self._load_ip_quotas()
-        entry = quotas.setdefault(ip, {"projects": 0, "messages_by_session": {}})
-        entry["messages_by_session"].setdefault(session_id, 0)
-        entry["messages_by_session"][session_id] += 1
-        self._save_ip_quotas(quotas)
-        return entry["messages_by_session"][session_id]
+        async with self._quota_lock:
+            quotas = self._load_ip_quotas()
+            entry = quotas.setdefault(ip, {"projects": 0, "messages_by_session": {}})
+            entry["messages_by_session"].setdefault(session_id, 0)
+            entry["messages_by_session"][session_id] += 1
+            self._save_ip_quotas(quotas)
+            return entry["messages_by_session"][session_id]
 
     def get_sessions_for_ip(self, ip: str) -> List[Dict[str, Any]]:
         """Return metadata for all sessions created by this IP."""
@@ -228,20 +235,21 @@ class SessionManager:
         result.sort(key=lambda s: s.get("last_activity", ""), reverse=True)
         return result
 
-    def remove_session_from_ip_index(self, session_id: str, ip: str) -> None:
+    async def remove_session_from_ip_index(self, session_id: str, ip: str) -> None:
         """Remove a deleted session from the IP index and update quota count."""
-        index = self._load_ip_index()
-        if ip in index:
-            index[ip] = [s for s in index[ip] if s != session_id]
-            if not index[ip]:
-                del index[ip]
-        self._save_ip_index(index)
+        async with self._quota_lock:
+            index = self._load_ip_index()
+            if ip in index:
+                index[ip] = [s for s in index[ip] if s != session_id]
+                if not index[ip]:
+                    del index[ip]
+            self._save_ip_index(index)
 
-        quotas = self._load_ip_quotas()
-        if ip in quotas:
-            quotas[ip]["projects"] = len(index.get(ip, []))
-            quotas[ip]["messages_by_session"].pop(session_id, None)
-        self._save_ip_quotas(quotas)
+            quotas = self._load_ip_quotas()
+            if ip in quotas:
+                quotas[ip]["projects"] = len(index.get(ip, []))
+                quotas[ip]["messages_by_session"].pop(session_id, None)
+            self._save_ip_quotas(quotas)
 
     # ── Session lifecycle ─────────────────────────────────────────────────────
 
